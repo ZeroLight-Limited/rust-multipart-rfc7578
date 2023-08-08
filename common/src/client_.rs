@@ -11,8 +11,8 @@ use crate::{
     error::Error,
 };
 use bytes::{BufMut, BytesMut};
-use futures_core::Stream;
-use futures_util::io::{AllowStdIo, AsyncRead, Cursor};
+use futures_core::{Stream, stream::BoxStream};
+use futures_util::{io::{AllowStdIo, AsyncRead, Cursor}, StreamExt};
 use http::{
     self,
     header::{self, HeaderName},
@@ -25,8 +25,7 @@ use std::{
     io::{self, Read},
     path::Path,
     pin::Pin,
-    task::{Context, Poll},
-    vec::IntoIter,
+    task::{Context, Poll, ready},
 };
 
 static CONTENT_DISPOSITION: HeaderName = header::CONTENT_DISPOSITION;
@@ -34,20 +33,24 @@ static CONTENT_TYPE: HeaderName = header::CONTENT_TYPE;
 
 /// Async streamable Multipart body.
 ///
+#[pin_project::pin_project]
 pub struct Body<'a> {
-    /// The amount of data to write with each chunk.
-    ///
-    buf: BytesMut,
-
     /// The active reader.
     ///
     current: NextPartState<'a>,
 
     /// The parts as an iterator. When the iterator stops
     /// yielding, the body is fully written.
-    ///
-    parts: IntoIter<Part<'a>>,
+    #[pin]
+    parts: BoxStream<'a, Part<'a>>,
 
+    body_formatter: BodyFormatter,
+}
+
+struct BodyFormatter {
+    /// The amount of data to write with each chunk.
+    ///
+    buf: BytesMut,
     /// The multipart boundary.
     ///
     boundary: String,
@@ -62,7 +65,7 @@ enum NextPartState<'a> {
     Current(Box<dyn 'a + AsyncRead + Send + Sync + Unpin>)
 }
 
-impl<'a> Body<'a> {
+impl BodyFormatter {
     /// Writes a CLRF.
     ///
     fn write_crlf(&mut self) {
@@ -109,13 +112,13 @@ impl<'a> Stream for Body<'a> {
     /// Iterate over each form part, and write it out.
     ///
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let body = self.get_mut();
+        let body = self.project();
 
         match body.current {
             NextPartState::MaybeMore { parts_seen } => {
-                if let Some(part) = body.parts.next() {
-                    body.write_boundary();
-                    body.write_headers(&part);
+                if let Some(part) = ready!(body.parts.poll_next(cx)) {
+                    body.body_formatter.write_boundary();
+                    body.body_formatter.write_headers(&part);
 
                     let read: Box<dyn AsyncRead + Send + Sync + Unpin> = match part.inner {
                         Inner::Read(read, _) => Box::new(AllowStdIo::new(read)),
@@ -123,22 +126,22 @@ impl<'a> Stream for Body<'a> {
                         Inner::Text(s) => Box::new(Cursor::new(s)),
                     };
 
-                    body.current = NextPartState::Current(read);
+                    *body.current = NextPartState::Current(read);
 
                     cx.waker().wake_by_ref();
 
-                    Poll::Ready(Some(Ok(body.buf.split())))
+                    Poll::Ready(Some(Ok(body.body_formatter.buf.split())))
                 } else {
                     // No current part, and no parts left means there is nothing
                     // left to write.
                     //
 
-                    if parts_seen {
+                    if *parts_seen {
                         // Write the final boundary
-                        body.write_final_boundary();
-                        body.write_crlf();
-                        body.current = NextPartState::NoMore;
-                        Poll::Ready(Some(Ok(body.buf.split())))
+                        body.body_formatter.write_final_boundary();
+                        body.body_formatter.write_crlf();
+                        *body.current = NextPartState::NoMore;
+                        Poll::Ready(Some(Ok(body.body_formatter.buf.split())))
                     } else {
                         Poll::Ready(None)
                     }
@@ -149,33 +152,33 @@ impl<'a> Stream for Body<'a> {
             },
             NextPartState::Current(ref mut read) => {
                 // Reserve some space to read the next part
-                body.buf.reserve(256);
-                let len_before = body.buf.len();
+                body.body_formatter.buf.reserve(256);
+                let len_before = body.body_formatter.buf.len();
 
                 // Init the remaining capacity to 0, and get a mut slice to it
-                body.buf.resize(body.buf.capacity(), 0);
-                let slice = &mut body.buf.as_mut()[len_before..];
+                body.body_formatter.buf.resize(body.body_formatter.buf.capacity(), 0);
+                let slice = &mut body.body_formatter.buf.as_mut()[len_before..];
 
                 match Pin::new(read).poll_read(cx, slice) {
                     Poll::Pending => {
-                        body.buf.truncate(len_before);
+                        body.body_formatter.buf.truncate(len_before);
                         Poll::Pending
                     }
                     // Read some data.
                     Poll::Ready(Ok(bytes_read)) => {
-                        body.buf.truncate(len_before + bytes_read);
+                        body.body_formatter.buf.truncate(len_before + bytes_read);
 
                         if bytes_read == 0 {
                             // EOF: No data left to read. Get ready to move onto write the next part.
-                            body.current = NextPartState::MaybeMore { parts_seen: true };
-                            body.write_crlf();
+                            *body.current = NextPartState::MaybeMore { parts_seen: true };
+                            body.body_formatter.write_crlf();
                         }
 
-                        Poll::Ready(Some(Ok(body.buf.split())))
+                        Poll::Ready(Some(Ok(body.body_formatter.buf.split())))
                     }
                     // Error reading from underlying stream.
                     Poll::Ready(Err(e)) => {
-                        body.buf.truncate(len_before);
+                        body.body_formatter.buf.truncate(len_before);
                         Poll::Ready(Some(Err(Error::ContentRead(e))))
                     }
                 }
@@ -593,10 +596,12 @@ impl<'a> From<Form<'a>> for Body<'a> {
     ///
     fn from(form: Form<'a>) -> Self {
         Body {
-            buf: BytesMut::with_capacity(2048),
             current: NextPartState::MaybeMore { parts_seen: false },
-            parts: form.parts.into_iter(),
-            boundary: form.boundary,
+            parts: futures_util::stream::iter(form.parts.into_iter()).boxed(),
+            body_formatter: BodyFormatter {
+                buf: BytesMut::with_capacity(2048),
+                boundary: form.boundary,
+            }
         }
     }
 }
