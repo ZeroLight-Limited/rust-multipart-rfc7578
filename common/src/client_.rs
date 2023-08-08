@@ -8,11 +8,14 @@
 
 use crate::{
     boundary::{BoundaryGenerator, RandomAsciiGenerator},
-    error::Error,
+    error::{self, DelayedFormError, Error},
 };
 use bytes::{BufMut, BytesMut};
-use futures_core::{Stream, stream::BoxStream};
-use futures_util::{io::{AllowStdIo, AsyncRead, Cursor}, StreamExt};
+use futures_core::{stream::BoxStream, Stream};
+use futures_util::{
+    io::{AllowStdIo, AsyncRead, Cursor},
+    SinkExt, StreamExt,
+};
 use http::{
     self,
     header::{self, HeaderName},
@@ -25,7 +28,7 @@ use std::{
     io::{self, Read},
     path::Path,
     pin::Pin,
-    task::{Context, Poll, ready},
+    task::{ready, Context, Poll},
 };
 
 static CONTENT_DISPOSITION: HeaderName = header::CONTENT_DISPOSITION;
@@ -62,7 +65,7 @@ enum NextPartState<'a> {
     /// There will be no more parts
     NoMore,
     /// In the middle of processing a part
-    Current(Box<dyn 'a + AsyncRead + Send + Sync + Unpin>)
+    Current(Box<dyn 'a + AsyncRead + Send + Sync + Unpin>),
 }
 
 impl BodyFormatter {
@@ -146,17 +149,17 @@ impl<'a> Stream for Body<'a> {
                         Poll::Ready(None)
                     }
                 }
-            },
-            NextPartState::NoMore => {
-                Poll::Ready(None)
-            },
+            }
+            NextPartState::NoMore => Poll::Ready(None),
             NextPartState::Current(ref mut read) => {
                 // Reserve some space to read the next part
                 body.body_formatter.buf.reserve(256);
                 let len_before = body.body_formatter.buf.len();
 
                 // Init the remaining capacity to 0, and get a mut slice to it
-                body.body_formatter.buf.resize(body.body_formatter.buf.capacity(), 0);
+                body.body_formatter
+                    .buf
+                    .resize(body.body_formatter.buf.capacity(), 0);
                 let slice = &mut body.body_formatter.buf.as_mut()[len_before..];
 
                 match Pin::new(read).poll_read(cx, slice) {
@@ -182,7 +185,7 @@ impl<'a> Stream for Body<'a> {
                         Poll::Ready(Some(Err(Error::ContentRead(e))))
                     }
                 }
-            },
+            }
         }
     }
 }
@@ -601,11 +604,384 @@ impl<'a> From<Form<'a>> for Body<'a> {
             body_formatter: BodyFormatter {
                 buf: BytesMut::with_capacity(2048),
                 boundary: form.boundary,
-            }
+            },
         }
     }
 }
 
+pub struct DelayedForm {
+    queue: futures::channel::mpsc::Sender<Part<'static>>,
+}
+
+impl DelayedForm {
+    /// Creates a new form with the specified boundary generator function.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use common_multipart_rfc7578::client::multipart::{
+    /// #     self,
+    /// #     BoundaryGenerator
+    /// # };
+    /// #
+    /// struct TestGenerator;
+    ///
+    /// impl BoundaryGenerator for TestGenerator {
+    ///     fn generate_boundary() -> String {
+    ///         "test".to_string()
+    ///     }
+    /// }
+    ///
+    /// let form = multipart::DelayedForm::new::<TestGenerator>();
+    /// ```
+    ///
+    pub fn new<G>(req: Builder) -> Result<(DelayedForm, Request<Body<'static>>), http::Error>
+    where
+        G: BoundaryGenerator,
+    {
+        let boundary = G::generate_boundary();
+        let content_type_header = content_type(&boundary);
+
+        let (tx, rx) = futures::channel::mpsc::channel(1);
+        let form = DelayedForm { queue: tx };
+        let body = Body {
+            current: NextPartState::MaybeMore { parts_seen: false },
+            parts: rx.boxed(),
+            body_formatter: BodyFormatter {
+                buf: BytesMut::with_capacity(2048),
+                boundary,
+            },
+        };
+        let req = req.header(&CONTENT_TYPE, content_type_header.as_str())
+            .body(body)?;
+
+        Ok((form, req))
+    }
+
+    /// Adds a text part to the Form.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use common_multipart_rfc7578::client::multipart;
+    ///
+    /// let mut form = multipart::Form::default();
+    ///
+    /// form.add_text("text", "Hello World!");
+    /// form.add_text("more", String::from("Hello Universe!"));
+    /// ```
+    ///
+    pub async fn add_text<N, T>(&mut self, name: N, text: T) -> Result<(), DelayedFormError>
+    where
+        N: Display,
+        T: Into<String>,
+    {
+        self.queue
+            .send(Part::new::<_, String>(
+                Inner::Text(text.into()),
+                name,
+                None,
+                None,
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// Adds a readable part to the Form.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use common_multipart_rfc7578::client::multipart;
+    /// use std::io::Cursor;
+    ///
+    /// let bytes = Cursor::new("Hello World!");
+    /// let mut form = multipart::Form::default();
+    ///
+    /// form.add_reader("input", bytes);
+    /// ```
+    ///
+    pub async fn add_reader<F, R>(
+        &mut self,
+        name: F,
+        read: R,
+    ) -> Result<(), error::DelayedFormError>
+    where
+        F: Display,
+        R: Read + Send + Sync + Unpin + 'static,
+    {
+        let read = Box::new(read);
+
+        self.queue
+            .send(Part::new::<_, String>(
+                Inner::Read(read, None),
+                name,
+                None,
+                None,
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// Adds a readable part to the Form.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use common_multipart_rfc7578::client::multipart;
+    /// use futures_util::io::Cursor;
+    ///
+    /// let bytes = Cursor::new("Hello World!");
+    /// let mut form = multipart::Form::default();
+    ///
+    /// form.add_async_reader("input", bytes);
+    /// ```
+    ///
+    pub async fn add_async_reader<F, R>(&mut self, name: F, read: R) -> Result<(), DelayedFormError>
+    where
+        F: Display,
+        R: AsyncRead + Send + Sync + Unpin + 'static,
+    {
+        let read = Box::new(read);
+
+        self.queue
+            .send(Part::new::<_, String>(
+                Inner::AsyncRead(read),
+                name,
+                None,
+                None,
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// Adds a file, and attempts to derive the mime type.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use common_multipart_rfc7578::client::multipart;
+    ///
+    /// let mut form = multipart::Form::default();
+    ///
+    /// form.add_file("file", file!()).expect("file to exist");
+    /// ```
+    ///
+    pub async fn add_file<P, F>(&mut self, name: F, path: P) -> Result<(), DelayedFormError>
+    where
+        P: AsRef<Path>,
+        F: Display,
+    {
+        self._add_file(name, path, None).await
+    }
+
+    /// Adds a file with the specified mime type to the form.
+    /// If the mime type isn't specified, a mime type will try to
+    /// be derived.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use common_multipart_rfc7578::client::multipart;
+    ///
+    /// let mut form = multipart::Form::default();
+    ///
+    /// form.add_file_with_mime("data", "test.csv", mime::TEXT_CSV);
+    /// ```
+    ///
+    pub async fn add_file_with_mime<P, F>(&mut self, name: F, path: P, mime: Mime) -> Result<(), DelayedFormError>
+    where
+        P: AsRef<Path>,
+        F: Display,
+    {
+        self._add_file(name, path, Some(mime)).await
+    }
+
+    /// Internal method for adding a file part to the form.
+    ///
+    async fn _add_file<P, F>(&mut self, name: F, path: P, mime: Option<Mime>) -> Result<(), DelayedFormError>
+    where
+        P: AsRef<Path>,
+        F: Display,
+    {
+        let f = File::open(&path)?;
+        let mime = mime.or_else(|| mime_guess::from_path(&path).first());
+
+        let len = match f.metadata() {
+            // If the path is not a file, it can't be uploaded because there
+            // is no content.
+            //
+            Ok(ref meta) if !meta.is_file() => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected a file not directory",
+            )),
+
+            // If there is some metadata on the file, try to derive some
+            // header values.
+            //
+            Ok(ref meta) => Ok(Some(meta.len())),
+
+            // The file metadata could not be accessed. This MIGHT not be an
+            // error, if the file could be opened.
+            //
+            Err(e) => Err(e),
+        }?;
+
+        let read = Box::new(f);
+
+        self.queue
+            .send(Part::new(
+                Inner::Read(read, len),
+                name,
+                mime,
+                Some(path.as_ref().as_os_str().to_string_lossy()),
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// Adds a readable part to the Form as a file.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use common_multipart_rfc7578::client::multipart;
+    /// use std::io::Cursor;
+    ///
+    /// let bytes = Cursor::new("Hello World!");
+    /// let mut form = multipart::Form::default();
+    ///
+    /// form.add_reader_file("input", bytes, "filename.txt");
+    /// ```
+    ///
+    pub async fn add_reader_file<F, G, R>(&mut self, name: F, read: R, filename: G) -> Result<(), DelayedFormError>
+    where
+        F: Display,
+        G: Into<String>,
+        R: Read + Send + Sync + Unpin + 'static,
+    {
+        let read = Box::new(read);
+
+        self.queue
+            .send(Part::new::<_, String>(
+                Inner::Read(read, None),
+                name,
+                None,
+                Some(filename.into()),
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// Adds a readable part to the Form as a file.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use common_multipart_rfc7578::client::multipart;
+    /// use futures_util::io::Cursor;
+    ///
+    /// let bytes = Cursor::new("Hello World!");
+    /// let mut form = multipart::Form::default();
+    ///
+    /// form.add_async_reader_file("input", bytes, "filename.txt");
+    /// ```
+    ///
+    pub async fn add_async_reader_file<F, G, R>(&mut self, name: F, read: R, filename: G) -> Result<(), DelayedFormError>
+    where
+        F: Display,
+        G: Into<String>,
+        R: AsyncRead + Send + Sync + Unpin + 'static,
+    {
+        let read = Box::new(read);
+
+        self.queue
+            .send(Part::new::<_, String>(
+                Inner::AsyncRead(read),
+                name,
+                None,
+                Some(filename.into()),
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// Adds a readable part to the Form as a file with a specified mime.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use common_multipart_rfc7578::client::multipart;
+    /// use std::io::Cursor;
+    ///
+    /// let bytes = Cursor::new("Hello World!");
+    /// let mut form = multipart::Form::default();
+    ///
+    /// form.add_reader_file_with_mime("input", bytes, "filename.txt", mime::TEXT_PLAIN);
+    /// ```
+    ///
+    pub async fn add_reader_file_with_mime<F, G, R>(
+        &mut self,
+        name: F,
+        read: R,
+        filename: G,
+        mime: Mime,
+    ) -> Result<(), DelayedFormError> where
+        F: Display,
+        G: Into<String>,
+        R: Read + Send + Sync + Unpin + 'static,
+    {
+        let read = Box::new(read);
+
+        self.queue.send(Part::new::<_, String>(
+            Inner::Read(read, None),
+            name,
+            Some(mime),
+            Some(filename.into()),
+        )).await?;
+        Ok(())
+    }
+
+    /// Adds a readable part to the Form as a file with a specified mime.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use common_multipart_rfc7578::client::multipart;
+    /// use futures_util::io::Cursor;
+    ///
+    /// let bytes = Cursor::new("Hello World!");
+    /// let mut form = multipart::Form::default();
+    ///
+    /// form.add_async_reader_file_with_mime("input", bytes, "filename.txt", mime::TEXT_PLAIN);
+    /// ```
+    ///
+    pub async fn add_async_reader_file_with_mime<F, G, R>(
+        &mut self,
+        name: F,
+        read: R,
+        filename: G,
+        mime: Mime,
+    ) -> Result<(), DelayedFormError> where
+        F: Display,
+        G: Into<String>,
+        R: AsyncRead + Send + Sync + Unpin + 'static,
+    {
+        let read = Box::new(read);
+
+        self.queue.send(Part::new::<_, String>(
+            Inner::AsyncRead(read),
+            name,
+            Some(mime),
+            Some(filename.into()),
+        )).await?;
+        Ok(())
+    }
+}
+
+pub fn content_type(boundary: &str) -> String {
+    format!("multipart/form-data; boundary={boundary}")
+}
 /// One part of a body delimited by a boundary line.
 ///
 /// [See RFC2046 5.1](https://tools.ietf.org/html/rfc2046#section-5.1).
@@ -800,29 +1176,35 @@ mod tests {
         let result: BytesMut = Body::from(form).try_concat().await.unwrap();
 
         let expected = [
-                b"--boundary\r\n".as_ref(),
-                b"content-type: text/plain\r\n".as_ref(),
-                b"content-disposition: form-data; name=\"name1\"\r\n".as_ref(),
-                b"\r\n".as_ref(),
-                b"value1\r\n".as_ref(),
-                b"--boundary\r\n".as_ref(),
-                b"content-type: text/plain\r\n".as_ref(),
-                b"content-disposition: form-data; name=\"name2\"\r\n".as_ref(),
-                b"\r\n".as_ref(),
-                b"value2\r\n".as_ref(),
-                b"--boundary\r\n".as_ref(),
-                b"content-type: application/octet-stream\r\n".as_ref(),
-                b"content-disposition: form-data; name=\"input\"\r\n".as_ref(),
-                b"\r\n".as_ref(),
-                b"Hello World!\r\n".as_ref(),
-                b"--boundary--\r\n".as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            .copied()
-            .collect::<Vec<u8>>();
+            b"--boundary\r\n".as_ref(),
+            b"content-type: text/plain\r\n".as_ref(),
+            b"content-disposition: form-data; name=\"name1\"\r\n".as_ref(),
+            b"\r\n".as_ref(),
+            b"value1\r\n".as_ref(),
+            b"--boundary\r\n".as_ref(),
+            b"content-type: text/plain\r\n".as_ref(),
+            b"content-disposition: form-data; name=\"name2\"\r\n".as_ref(),
+            b"\r\n".as_ref(),
+            b"value2\r\n".as_ref(),
+            b"--boundary\r\n".as_ref(),
+            b"content-type: application/octet-stream\r\n".as_ref(),
+            b"content-disposition: form-data; name=\"input\"\r\n".as_ref(),
+            b"\r\n".as_ref(),
+            b"Hello World!\r\n".as_ref(),
+            b"--boundary--\r\n".as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .copied()
+        .collect::<Vec<u8>>();
 
-        assert_eq!(result, expected, "actual\n{}\nexpected\n{}", String::from_utf8_lossy(result.as_ref()), String::from_utf8_lossy(&expected));
+        assert_eq!(
+            result,
+            expected,
+            "actual\n{}\nexpected\n{}",
+            String::from_utf8_lossy(result.as_ref()),
+            String::from_utf8_lossy(&expected)
+        );
     }
 
     #[tokio::test]

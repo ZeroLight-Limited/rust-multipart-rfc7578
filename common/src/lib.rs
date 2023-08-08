@@ -54,7 +54,7 @@ pub mod client {
     pub mod multipart {
         pub use crate::{
             boundary::BoundaryGenerator,
-            client_::{Body, Form},
+            client_::{Body, Form, DelayedForm},
         };
     }
 }

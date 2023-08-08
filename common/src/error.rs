@@ -22,3 +22,11 @@ impl Into<IoError> for Error {
         }
     }
 }
+
+#[derive(Debug, Error)]
+pub enum DelayedFormError {
+    #[error("Target request body was dropped")]
+    BodyDropped(#[from] futures::channel::mpsc::SendError),
+    #[error("IO Error while preparing multipart field")]
+    IoError(#[from] std::io::Error)
+}
