@@ -23,7 +23,6 @@ use std::{
     fmt::Display,
     fs::File,
     io::{self, Read},
-    iter::Peekable,
     path::Path,
     pin::Pin,
     task::{Context, Poll},
@@ -42,16 +41,25 @@ pub struct Body<'a> {
 
     /// The active reader.
     ///
-    current: Option<Box<dyn 'a + AsyncRead + Send + Sync + Unpin>>,
+    current: NextPartState<'a>,
 
     /// The parts as an iterator. When the iterator stops
     /// yielding, the body is fully written.
     ///
-    parts: Peekable<IntoIter<Part<'a>>>,
+    parts: IntoIter<Part<'a>>,
 
     /// The multipart boundary.
     ///
     boundary: String,
+}
+
+enum NextPartState<'a> {
+    /// There might be more parts
+    MaybeMore { parts_seen: bool },
+    /// There will be no more parts
+    NoMore,
+    /// In the middle of processing a part
+    Current(Box<dyn 'a + AsyncRead + Send + Sync + Unpin>)
 }
 
 impl<'a> Body<'a> {
@@ -104,7 +112,7 @@ impl<'a> Stream for Body<'a> {
         let body = self.get_mut();
 
         match body.current {
-            None => {
+            NextPartState::MaybeMore { parts_seen } => {
                 if let Some(part) = body.parts.next() {
                     body.write_boundary();
                     body.write_headers(&part);
@@ -115,7 +123,7 @@ impl<'a> Stream for Body<'a> {
                         Inner::Text(s) => Box::new(Cursor::new(s)),
                     };
 
-                    body.current = Some(read);
+                    body.current = NextPartState::Current(read);
 
                     cx.waker().wake_by_ref();
 
@@ -124,10 +132,22 @@ impl<'a> Stream for Body<'a> {
                     // No current part, and no parts left means there is nothing
                     // left to write.
                     //
-                    Poll::Ready(None)
+
+                    if parts_seen {
+                        // Write the final boundary
+                        body.write_final_boundary();
+                        body.write_crlf();
+                        body.current = NextPartState::NoMore;
+                        Poll::Ready(Some(Ok(body.buf.split())))
+                    } else {
+                        Poll::Ready(None)
+                    }
                 }
-            }
-            Some(ref mut read) => {
+            },
+            NextPartState::NoMore => {
+                Poll::Ready(None)
+            },
+            NextPartState::Current(ref mut read) => {
                 // Reserve some space to read the next part
                 body.buf.reserve(256);
                 let len_before = body.buf.len();
@@ -147,13 +167,8 @@ impl<'a> Stream for Body<'a> {
 
                         if bytes_read == 0 {
                             // EOF: No data left to read. Get ready to move onto write the next part.
-                            body.current = None;
+                            body.current = NextPartState::MaybeMore { parts_seen: true };
                             body.write_crlf();
-                            if body.parts.peek().is_none() {
-                                // If there is no next part, write the final boundary
-                                body.write_final_boundary();
-                                body.write_crlf();
-                            }
                         }
 
                         Poll::Ready(Some(Ok(body.buf.split())))
@@ -164,7 +179,7 @@ impl<'a> Stream for Body<'a> {
                         Poll::Ready(Some(Err(Error::ContentRead(e))))
                     }
                 }
-            }
+            },
         }
     }
 }
@@ -579,8 +594,8 @@ impl<'a> From<Form<'a>> for Body<'a> {
     fn from(form: Form<'a>) -> Self {
         Body {
             buf: BytesMut::with_capacity(2048),
-            current: None,
-            parts: form.parts.into_iter().peekable(),
+            current: NextPartState::MaybeMore { parts_seen: false },
+            parts: form.parts.into_iter(),
             boundary: form.boundary,
         }
     }
@@ -779,9 +794,7 @@ mod tests {
 
         let result: BytesMut = Body::from(form).try_concat().await.unwrap();
 
-        assert_eq!(
-            result.as_ref(),
-            [
+        let expected = [
                 b"--boundary\r\n".as_ref(),
                 b"content-type: text/plain\r\n".as_ref(),
                 b"content-disposition: form-data; name=\"name1\"\r\n".as_ref(),
@@ -802,8 +815,17 @@ mod tests {
             .into_iter()
             .flatten()
             .copied()
-            .collect::<Vec<u8>>()
-        );
+            .collect::<Vec<u8>>();
+
+        assert_eq!(result, expected, "actual\n{}\nexpected\n{}", String::from_utf8_lossy(result.as_ref()), String::from_utf8_lossy(&expected));
+    }
+
+    #[tokio::test]
+    async fn test_empty_form() {
+        let form = Form::new::<FixedBoundary>();
+        let result: BytesMut = Body::from(form).try_concat().await.unwrap();
+
+        assert_eq!(b"", result.as_ref());
     }
 
     #[tokio::test]
