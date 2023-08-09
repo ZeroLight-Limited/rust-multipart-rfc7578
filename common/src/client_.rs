@@ -609,20 +609,50 @@ impl<'a> From<Form<'a>> for Body<'a> {
     }
 }
 
+/// A form that where fields can still be set after the request headers are sent
+/// Use delayed form when you don't know in advance how many fields you need to send in the
+/// multipart request.
 pub struct DelayedForm {
     queue: futures::channel::mpsc::Sender<Part<'static>>,
 }
 
 impl DelayedForm {
-    /// Creates a new form with the specified boundary generator function.
+    /// Sets up a request by setting the content type headers and body returning a built request
+    /// and a DelayedForm
     ///
     /// # Examples
     ///
     /// ```
     /// # use common_multipart_rfc7578::client::multipart::{
     /// #     self,
-    /// #     BoundaryGenerator
     /// # };
+    /// # use http::request::Builder;
+    /// #
+    ///
+    /// # async { 
+    /// let req = Builder::new()
+    ///       .uri("http://example.com")
+    ///       .method(http::Method::POST);
+    /// let (mut form, request) = multipart::DelayedForm::new(req).unwrap();
+    /// 
+    /// form.add_text("hello", "world").await;
+    /// # };
+    /// ```
+    ///
+    pub fn new(req: Builder) -> Result<(DelayedForm, Request<Body<'static>>), http::Error> {
+        Self::new_with_boundary_generator::<RandomAsciiGenerator>(req)
+    }
+
+    /// Creates a new with a custom boundary generator
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use common_multipart_rfc7578::client::multipart::{
+    /// #     BoundaryGenerator,
+    /// #     self,
+    /// # };
+    /// # use http::request::Builder;
     /// #
     /// struct TestGenerator;
     ///
@@ -631,13 +661,16 @@ impl DelayedForm {
     ///         "test".to_string()
     ///     }
     /// }
-    ///
-    /// let form = multipart::DelayedForm::new::<TestGenerator>();
+    /// 
+    /// let req = Builder::new()
+    ///       .uri("http://example.com")
+    ///       .method(http::Method::POST);
+    /// let (form, request) = multipart::DelayedForm::new_with_boundary_generator::<TestGenerator>(req).unwrap();
     /// ```
     ///
-    pub fn new<G>(req: Builder) -> Result<(DelayedForm, Request<Body<'static>>), http::Error>
+    pub fn new_with_boundary_generator<G>(req: Builder) -> Result<(DelayedForm, Request<Body<'static>>), http::Error> 
     where
-        G: BoundaryGenerator,
+       G: BoundaryGenerator
     {
         let boundary = G::generate_boundary();
         let content_type_header = content_type(&boundary);
@@ -658,19 +691,6 @@ impl DelayedForm {
         Ok((form, req))
     }
 
-    /// Adds a text part to the Form.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use common_multipart_rfc7578::client::multipart;
-    ///
-    /// let mut form = multipart::Form::default();
-    ///
-    /// form.add_text("text", "Hello World!");
-    /// form.add_text("more", String::from("Hello Universe!"));
-    /// ```
-    ///
     pub async fn add_text<N, T>(&mut self, name: N, text: T) -> Result<(), DelayedFormError>
     where
         N: Display,
@@ -687,20 +707,6 @@ impl DelayedForm {
         Ok(())
     }
 
-    /// Adds a readable part to the Form.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use common_multipart_rfc7578::client::multipart;
-    /// use std::io::Cursor;
-    ///
-    /// let bytes = Cursor::new("Hello World!");
-    /// let mut form = multipart::Form::default();
-    ///
-    /// form.add_reader("input", bytes);
-    /// ```
-    ///
     pub async fn add_reader<F, R>(
         &mut self,
         name: F,
@@ -723,20 +729,6 @@ impl DelayedForm {
         Ok(())
     }
 
-    /// Adds a readable part to the Form.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use common_multipart_rfc7578::client::multipart;
-    /// use futures_util::io::Cursor;
-    ///
-    /// let bytes = Cursor::new("Hello World!");
-    /// let mut form = multipart::Form::default();
-    ///
-    /// form.add_async_reader("input", bytes);
-    /// ```
-    ///
     pub async fn add_async_reader<F, R>(&mut self, name: F, read: R) -> Result<(), DelayedFormError>
     where
         F: Display,
@@ -755,18 +747,6 @@ impl DelayedForm {
         Ok(())
     }
 
-    /// Adds a file, and attempts to derive the mime type.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use common_multipart_rfc7578::client::multipart;
-    ///
-    /// let mut form = multipart::Form::default();
-    ///
-    /// form.add_file("file", file!()).expect("file to exist");
-    /// ```
-    ///
     pub async fn add_file<P, F>(&mut self, name: F, path: P) -> Result<(), DelayedFormError>
     where
         P: AsRef<Path>,
@@ -775,20 +755,6 @@ impl DelayedForm {
         self._add_file(name, path, None).await
     }
 
-    /// Adds a file with the specified mime type to the form.
-    /// If the mime type isn't specified, a mime type will try to
-    /// be derived.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use common_multipart_rfc7578::client::multipart;
-    ///
-    /// let mut form = multipart::Form::default();
-    ///
-    /// form.add_file_with_mime("data", "test.csv", mime::TEXT_CSV);
-    /// ```
-    ///
     pub async fn add_file_with_mime<P, F>(&mut self, name: F, path: P, mime: Mime) -> Result<(), DelayedFormError>
     where
         P: AsRef<Path>,
