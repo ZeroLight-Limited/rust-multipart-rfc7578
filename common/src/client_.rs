@@ -616,6 +616,11 @@ pub struct DelayedForm {
     queue: futures::channel::mpsc::Sender<Part<'static>>,
 }
 
+pub struct RequestDetails<'a> {
+    pub body: Body<'a>,
+    pub content_type_header: http::HeaderValue
+}
+
 impl DelayedForm {
     /// Sets up a request by setting the content type headers and body returning a built request
     /// and a DelayedForm
@@ -630,17 +635,20 @@ impl DelayedForm {
     /// #
     ///
     /// # async { 
+    /// let (mut form, request_details) = multipart::DelayedForm::new().unwrap();
     /// let req = Builder::new()
     ///       .uri("http://example.com")
-    ///       .method(http::Method::POST);
-    /// let (mut form, request) = multipart::DelayedForm::new(req).unwrap();
+    ///       .header(http::header::CONTENT_TYPE, request_details.content_type_header)
+    ///       .method(http::Method::POST)
+    ///       .body(request_details.body)
+    ///       .unwrap();
     /// 
     /// form.add_text("hello", "world").await;
     /// # };
     /// ```
     ///
-    pub fn new(req: Builder) -> Result<(DelayedForm, Request<Body<'static>>), http::Error> {
-        Self::new_with_boundary_generator::<RandomAsciiGenerator>(req)
+    pub fn new() -> Result<(DelayedForm, RequestDetails<'static>), http::Error> {
+        Self::new_with_boundary_generator::<RandomAsciiGenerator>()
     }
 
     /// Creates a new with a custom boundary generator
@@ -665,10 +673,10 @@ impl DelayedForm {
     /// let req = Builder::new()
     ///       .uri("http://example.com")
     ///       .method(http::Method::POST);
-    /// let (form, request) = multipart::DelayedForm::new_with_boundary_generator::<TestGenerator>(req).unwrap();
+    /// let (form, request) = multipart::DelayedForm::new_with_boundary_generator::<TestGenerator>().unwrap();
     /// ```
     ///
-    pub fn new_with_boundary_generator<G>(req: Builder) -> Result<(DelayedForm, Request<Body<'static>>), http::Error> 
+    pub fn new_with_boundary_generator<G>() -> Result<(DelayedForm, RequestDetails<'static>), http::Error> 
     where
        G: BoundaryGenerator
     {
@@ -685,9 +693,10 @@ impl DelayedForm {
                 boundary,
             },
         };
-        let req = req.header(&CONTENT_TYPE, content_type_header.as_str())
-            .body(body)?;
-
+        let req = RequestDetails {
+            body,
+            content_type_header: content_type_header.parse()?
+        };
         Ok((form, req))
     }
 
