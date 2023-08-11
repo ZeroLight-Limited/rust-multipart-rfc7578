@@ -65,7 +65,7 @@ enum NextPartState<'a> {
     /// There will be no more parts
     NoMore,
     /// In the middle of processing a part
-    Current(Box<dyn 'a + AsyncRead + Send + Sync + Unpin>),
+    Current(Box<dyn 'a + AsyncRead + Send + Unpin>),
 }
 
 impl BodyFormatter {
@@ -123,7 +123,7 @@ impl<'a> Stream for Body<'a> {
                     body.body_formatter.write_boundary();
                     body.body_formatter.write_headers(&part);
 
-                    let read: Box<dyn AsyncRead + Send + Sync + Unpin> = match part.inner {
+                    let read: Box<dyn AsyncRead + Send + Unpin> = match part.inner {
                         Inner::Read(read, _) => Box::new(AllowStdIo::new(read)),
                         Inner::AsyncRead(read) => read,
                         Inner::Text(s) => Box::new(Cursor::new(s)),
@@ -612,8 +612,8 @@ impl<'a> From<Form<'a>> for Body<'a> {
 /// A form that where fields can still be set after the request headers are sent
 /// Use delayed form when you don't know in advance how many fields you need to send in the
 /// multipart request.
-pub struct DelayedForm {
-    queue: futures::channel::mpsc::Sender<Part<'static>>,
+pub struct DelayedForm<'a> {
+    queue: futures::channel::mpsc::Sender<Part<'a>>,
 }
 
 pub struct RequestDetails<'a> {
@@ -621,7 +621,7 @@ pub struct RequestDetails<'a> {
     pub content_type_header: http::HeaderValue
 }
 
-impl DelayedForm {
+impl<'a> DelayedForm<'a> {
     /// Sets up a request by setting the content type headers and body returning a built request
     /// and a DelayedForm
     ///
@@ -647,8 +647,12 @@ impl DelayedForm {
     /// # };
     /// ```
     ///
-    pub fn new() -> Result<(DelayedForm, RequestDetails<'static>), http::Error> {
+    pub fn new() -> Result<(DelayedForm<'a>, RequestDetails<'a>), http::Error> {
         Self::new_with_boundary_generator::<RandomAsciiGenerator>()
+    }
+
+    pub fn test(&self) -> std::future::Pending<()> {
+        std::future::pending()
     }
 
     /// Creates a new with a custom boundary generator
@@ -676,7 +680,7 @@ impl DelayedForm {
     /// let (form, request) = multipart::DelayedForm::new_with_boundary_generator::<TestGenerator>().unwrap();
     /// ```
     ///
-    pub fn new_with_boundary_generator<G>() -> Result<(DelayedForm, RequestDetails<'static>), http::Error> 
+    pub fn new_with_boundary_generator<G>() -> Result<(DelayedForm<'a>, RequestDetails<'a>), http::Error> 
     where
        G: BoundaryGenerator
     {
@@ -940,7 +944,7 @@ impl DelayedForm {
     ) -> Result<(), DelayedFormError> where
         F: Display,
         G: Into<String>,
-        R: AsyncRead + Send + Sync + Unpin + 'static,
+        R: AsyncRead + Send + Unpin + 'a,
     {
         let read = Box::new(read);
 
@@ -1032,7 +1036,7 @@ enum Inner<'a> {
     ///
     Read(Box<dyn 'a + Read + Send + Sync + Unpin>, Option<u64>),
 
-    AsyncRead(Box<dyn 'a + AsyncRead + Send + Sync + Unpin>),
+    AsyncRead(Box<dyn 'a + AsyncRead + Send + Unpin>),
 
     /// The `String` variant handles "text/plain" form data payloads.
     ///
